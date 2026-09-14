@@ -148,6 +148,14 @@ def identify_machine(raw_text):
     if any(k in low for k in ["forklift", "telehandler", "rough terrain forklift"]):
         return {"category":"MISC","normalized":"MISC — Forklift/Telehandler","family":"Forklift/Telehandler","size":size,"matched_key":None}
 
+    # PWCS invoice shorthand for diesel articulating/knuckle booms.
+    # Examples: "34ft Diesel B", "45ft Diesel B", "125ft Diesel B".
+    if re.search(r"\b(?:34|45|60|80|125|135)\s*ft\s+diesel\s+b\b", low):
+        family = "Articulating Boom Lift"
+        key = f"Diesel Knuckle Boom {size}ft" if size else None
+        if key in RATE_CARD:
+            return {"category":"RATE_CARD","normalized":key,"family":family,"size":size,"matched_key":key}
+
     # Generic family labels
     if "boom lift - a" in low or ("articulating" in low and size is None):
         return {"category":"FAMILY_ONLY","normalized":"Articulating Boom Lift — SIZE UNKNOWN","family":"Articulating Boom Lift","size":None,"matched_key":None}
@@ -184,7 +192,8 @@ def identify_machine(raw_text):
             key = f"Diesel Knuckle Boom {size}ft"
             if key in RATE_CARD:
                 return {"category":"RATE_CARD","normalized":key,"family":family,"size":size,"matched_key":key}
-        return {"category":"FAMILY_ONLY","normalized":"Articulating Boom Lift — SIZE UNKNOWN","family":family,"size":size,"matched_key":None}
+        label = f"Articulating Boom Lift {size}ft — NOT ON STANDARD RATE CARD" if size else "Articulating Boom Lift — SIZE UNKNOWN"
+        return {"category":"FAMILY_ONLY","normalized":label,"family":family,"size":size,"matched_key":None}
 
     return {"category":"UNKNOWN","normalized":"UNRECOGNISED — CHECK MACHINE","family":None,"size":size,"matched_key":None}
 
@@ -369,7 +378,7 @@ def parse_invoice_lines(text):
 
     # Link transport rows to hire rows where possible
     link_transports(rows, hire_rows)
-    return rows
+    return ensure_in_lieu_field(row)s
 
 # =========================================================
 # TRANSPORT -> HIRE LINKING
@@ -456,6 +465,79 @@ def nearest_transport_matches(family, billed):
     best = min(x[0] for x in diffs)
     return [(key, rate, cpas) for d,key,rate,cpas in diffs if abs(d-best) < 0.01]
 
+def find_in_lieu_hire_match(row):
+    """
+    Detect an actual supplied machine that is not on the standard PWCS rate-card
+    size but is billed at a valid smaller machine rate in the same family.
+
+    Returns a unique smaller-machine match where possible.
+    """
+    actual_size = row.get("size")
+    family = row.get("family")
+    billed_rate = row.get("billed_rate")
+    billed_amount = row.get("billed_amount")
+    days = row.get("days")
+
+    if family != "Articulating Boom Lift" or actual_size is None:
+        return None
+
+    candidates = []
+    for key, rc in RATE_CARD.items():
+        if rc.get("family") != family:
+            continue
+
+        m = re.search(r"(\d{2,3})ft$", key)
+        if not m:
+            continue
+        candidate_size = int(m.group(1))
+        if candidate_size >= actual_size:
+            continue
+
+        # Match either the displayed weekly/daily rate or the actual prorated amount.
+        for basis, rate, cpas in (
+            ("daily", rc.get("daily"), rc.get("daily_cpas")),
+            ("weekly", rc.get("weekly"), rc.get("weekly_cpas")),
+        ):
+            if rate is None:
+                continue
+
+            rate_match = billed_rate is not None and abs(billed_rate - rate) < 0.01
+            amount_match = False
+            expected_amount = None
+
+            if days is not None:
+                if basis == "daily":
+                    expected_amount = round(rate * days, 2)
+                else:
+                    expected_amount = round((rate / 7.0) * days, 2)
+
+                if billed_amount is not None and abs(billed_amount - expected_amount) < 0.01:
+                    amount_match = True
+
+            if rate_match or amount_match:
+                candidates.append({
+                    "key": key,
+                    "size": candidate_size,
+                    "basis": basis,
+                    "rate": rate,
+                    "cpas": cpas,
+                    "expected_amount": expected_amount,
+                })
+
+    # Prefer exact displayed-rate matches, then the closest smaller size.
+    if not candidates:
+        return None
+
+    exact_rate = [c for c in candidates if billed_rate is not None and abs(c["rate"] - billed_rate) < 0.01]
+    pool = exact_rate or candidates
+    pool.sort(key=lambda c: c["size"], reverse=True)
+
+    # Only return a confident top match.
+    top = pool[0]
+    same_top = [c for c in pool if c["size"] == top["size"] and c["basis"] == top["basis"]]
+    return top if len(same_top) == 1 else top
+
+
 def validate_hire(row):
     out = {}
     cat = row.get("machine_category")
@@ -476,6 +558,29 @@ def validate_hire(row):
         return out
 
     if not key or key not in RATE_CARD:
+        in_lieu = find_in_lieu_hire_match(row)
+        if in_lieu:
+            expected_amount = in_lieu.get("expected_amount")
+            variance = None
+            if expected_amount is not None and billed_amount is not None:
+                variance = round(billed_amount - expected_amount, 2)
+
+            smaller_label = in_lieu["key"]
+            out.update({
+                "expected_rate":in_lieu["rate"],
+                "expected_amount":expected_amount,
+                "variance_ex_gst":variance,
+                "expected_cpas":in_lieu["cpas"],
+                "in_lieu_cpas":in_lieu["cpas"],
+                "validation_result":f"IN LIEU — MATCHES {smaller_label}",
+                "recommended_action":(
+                    f"Actual supplied machine is {row.get('size')}ft, but billing matches "
+                    f"{smaller_label}. Use CPAS {in_lieu['cpas']} for the approved in-lieu billing "
+                    f"and confirm the substitution; do not credit automatically."
+                ),
+            })
+            return out
+
         out.update({
             "expected_rate":None,
             "expected_amount":None,
@@ -628,6 +733,12 @@ def validate_transport(row):
         "recommended_action":action,
     }
 
+def ensure_in_lieu_field(result):
+    if "in_lieu_cpas" not in result:
+        result["in_lieu_cpas"] = None
+    return result
+
+
 def validate_row(row):
     if row["charge_type"] == "Diesel":
         exp = round((row["quantity"] or 0)*FUEL_RATE,2)
@@ -651,13 +762,13 @@ def validate_row(row):
             "expected_cpas":None,
             "validation_result":"REVIEW — UNSUPPORTED CHARGE",
             "recommended_action":"Check supporting agreement/approval for transport levy.",
-        }
+        })
 
     if row["charge_type"] == "Hire":
-        return {**row, **validate_hire(row)}
+        return ensure_in_lieu_field({**row, **validate_hire(row)})
 
     if row["charge_type"] in ("Delivery","Collection"):
-        return {**row, **validate_transport(row)}
+        return ensure_in_lieu_field({**row, **validate_transport(row)})
 
     return row
 
@@ -686,9 +797,9 @@ def overall_status(rows, recon):
 # UI
 # =========================================================
 
-st.set_page_config(page_title="PWCS Invoice Parser Prototype — V3.2", layout="wide")
-st.title("PWCS Invoice Parser Prototype — V3.2")
-st.caption("V3.2: validates generic transport against same-size hire machines on the invoice, while preserving safe asset linking.")
+st.set_page_config(page_title="PWCS Invoice Parser Prototype — V3.4", layout="wide")
+st.title("PWCS Invoice Parser Prototype — V3.4")
+st.caption("V3.4: adds explicit CPAS visibility for in-lieu machines, including the matched smaller-machine CPAS code.")
 
 uploaded = st.file_uploader("Upload PWCS invoice PDF", type=["pdf"])
 
@@ -732,6 +843,7 @@ if uploaded:
         "expected_amount",
         "variance_ex_gst",
         "expected_cpas",
+        "in_lieu_cpas",
         "validation_result",
         "recommended_action",
     ]
