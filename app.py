@@ -378,7 +378,7 @@ def parse_invoice_lines(text):
 
     # Link transport rows to hire rows where possible
     link_transports(rows, hire_rows)
-    return ensure_in_lieu_field(row)s
+    return rows
 
 # =========================================================
 # TRANSPORT -> HIRE LINKING
@@ -741,61 +741,37 @@ def ensure_in_lieu_field(result):
 
 def validate_row(row):
     if row["charge_type"] == "Diesel":
-        exp = round((row["quantity"] or 0)*FUEL_RATE,2)
-        var = round((row["billed_amount"] or 0)-exp,2)
-        return {
+        exp = round((row["quantity"] or 0) * FUEL_RATE, 2)
+        var = round((row["billed_amount"] or 0) - exp, 2)
+        return ensure_in_lieu_field({
             **row,
-            "expected_rate":FUEL_RATE,
-            "expected_amount":exp,
-            "variance_ex_gst":var,
-            "expected_cpas":FUEL_CPAS,
-            "validation_result":"PASS" if abs(var)<0.01 else ("CREDIT REQUIRED" if var>0 else "UNDERBILLED — REVIEW"),
-            "recommended_action":"No action required." if abs(var)<0.01 else (f"Credit required: ${var:.2f} ex GST." if var>0 else f"Underbilled by ${abs(var):.2f} ex GST.")
-        }
+            "expected_rate": FUEL_RATE,
+            "expected_amount": exp,
+            "variance_ex_gst": var,
+            "expected_cpas": FUEL_CPAS,
+            "validation_result": "PASS" if abs(var) < 0.01 else ("CREDIT REQUIRED" if var > 0 else "UNDERBILLED — REVIEW"),
+            "recommended_action": "No action required." if abs(var) < 0.01 else (f"Credit required: ${var:.2f} ex GST." if var > 0 else f"Underbilled by ${abs(var):.2f} ex GST.")
+        })
 
     if row["charge_type"] == "Transport Levy":
-        return {
+        return ensure_in_lieu_field({
             **row,
-            "expected_rate":None,
-            "expected_amount":None,
-            "variance_ex_gst":None,
-            "expected_cpas":None,
-            "validation_result":"REVIEW — UNSUPPORTED CHARGE",
-            "recommended_action":"Check supporting agreement/approval for transport levy.",
+            "expected_rate": None,
+            "expected_amount": None,
+            "variance_ex_gst": None,
+            "expected_cpas": None,
+            "validation_result": "REVIEW — UNSUPPORTED CHARGE",
+            "recommended_action": "Check supporting agreement/approval for transport levy.",
         })
 
     if row["charge_type"] == "Hire":
         return ensure_in_lieu_field({**row, **validate_hire(row)})
 
-    if row["charge_type"] in ("Delivery","Collection"):
+    if row["charge_type"] in ("Delivery", "Collection"):
         return ensure_in_lieu_field({**row, **validate_transport(row)})
 
-    return row
+    return ensure_in_lieu_field(row)
 
-def reconcile(header, rows):
-    subtotal = header.get("subtotal_ex_gst")
-    extracted = round(sum((r.get("billed_amount") or 0) for r in rows),2)
-    diff = None if subtotal is None else round(subtotal-extracted,2)
-    return {
-        "extracted_total":extracted,
-        "subtotal":subtotal,
-        "difference":diff,
-        "status":"PASS" if diff is not None and abs(diff)<0.01 else "PARSING INCOMPLETE"
-    }
-
-def overall_status(rows, recon):
-    if recon["status"] != "PASS":
-        return "PARSING INCOMPLETE — DO NOT VALIDATE"
-    statuses = [r.get("validation_result","") for r in rows]
-    if any("CREDIT REQUIRED" in s for s in statuses):
-        return "CREDIT REQUIRED"
-    if any(any(x in s for x in ["CHECK","REVIEW","MISC","RATE CAPTURE"]) for s in statuses):
-        return "REVIEW REQUIRED"
-    return "VALIDATED — READY"
-
-# =========================================================
-# UI
-# =========================================================
 
 st.set_page_config(page_title="PWCS Invoice Parser Prototype — V3.4", layout="wide")
 st.title("PWCS Invoice Parser Prototype — V3.4")
