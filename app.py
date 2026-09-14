@@ -773,9 +773,32 @@ def validate_row(row):
     return ensure_in_lieu_field(row)
 
 
-st.set_page_config(page_title="PWCS Invoice Parser Prototype — V3.4", layout="wide")
-st.title("PWCS Invoice Parser Prototype — V3.4")
-st.caption("V3.4: adds explicit CPAS visibility for in-lieu machines, including the matched smaller-machine CPAS code.")
+def reconcile(header, rows):
+    subtotal = header.get("subtotal_ex_gst")
+    extracted = round(sum((r.get("billed_amount") or 0) for r in rows), 2)
+    diff = None if subtotal is None else round(subtotal - extracted, 2)
+    return {
+        "extracted_total": extracted,
+        "subtotal": subtotal,
+        "difference": diff,
+        "status": "PASS" if diff is not None and abs(diff) < 0.01 else "PARSING INCOMPLETE",
+    }
+
+
+def overall_status(rows, recon):
+    if recon["status"] != "PASS":
+        return "PARSING INCOMPLETE — DO NOT VALIDATE"
+    statuses = [r.get("validation_result", "") for r in rows]
+    if any("CREDIT REQUIRED" in s for s in statuses):
+        return "CREDIT REQUIRED"
+    if any(any(x in s for x in ["CHECK", "REVIEW", "MISC", "RATE CAPTURE", "IN LIEU"]) for s in statuses):
+        return "REVIEW REQUIRED"
+    return "VALIDATED — READY"
+
+
+st.set_page_config(page_title="PWCS Invoice Parser Prototype — V3.4.1", layout="wide")
+st.title("PWCS Invoice Parser Prototype — V3.4.1")
+st.caption("V3.4.1: restores reconciliation after the in-lieu CPAS patch; in-lieu CPAS visibility remains enabled.")
 
 uploaded = st.file_uploader("Upload PWCS invoice PDF", type=["pdf"])
 
